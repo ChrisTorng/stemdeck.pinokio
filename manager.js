@@ -1,0 +1,58 @@
+'use strict';
+const fs=require('node:fs'),fp=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),crypto=require('node:crypto'),cp=require('node:child_process');
+const {Readable}=require('node:stream'),{pipeline}=require('node:stream/promises');
+const root=__dirname,app=path.join(root,'app'),headers={'User-Agent':'pinokio-launcher','Accept':'application/vnd.github+json'};
+function die(s){throw Error(s)}
+function run(cmd,args,opts={}){let p=cp.spawnSync(cmd,args,{stdio:'inherit',...opts});if(p.error)throw p.error;if(p.status!==0)die(cmd+' failed: '+p.status);}
+async function gh(url){let r=await fetch(url,{headers});if(!r.ok)die('GitHub HTTP '+r.status);return r.json();}
+async function release(repo,beta){if(!beta)return gh('https://api.github.com/repos/'+repo+'/releases/latest');let all=await gh('https://api.github.com/repos/'+repo+'/releases?per_page=20');return all.find(r=>!r.draft&&r.assets?.length)||die('No release');}
+async function download(url,to){let r=await fetch(url,{headers});if(!r.ok||!r.body)die('Download failed '+r.status);await pipeline(Readable.fromWeb(r.body),fs.createWriteStream(to));}
+async function digest(file){let h=crypto.createHash('sha256');await new Promise((ok,bad)=>fs.createReadStream(file).on('data',x=>h.update(x)).on('error',bad).on('end',ok));return h.digest('hex');}
+async function verify(rel,asset,file){
+ let expected=/^sha256:([0-9a-f]{64})$/i.exec(asset.digest||'')?.[1];
+ if(!expected){let sum=rel.assets.find(x=>x.name==='SHA256SUMS');if(!sum)die('No upstream checksum');let res=await fetch(sum.browser_download_url,{headers});if(!res.ok)die('Checksum download failed');
+ let items=(await res.text()).split(/\r?\n/).map(l=>/^([0-9a-f]{64})\s+\*?(.+)$/i.exec(l)).filter(Boolean);expected=items.find(x=>x[2].trim()===asset.name)?.[1];if(!expected)die('No matching checksum');}
+ if((await digest(file)).toLowerCase()!==expected.toLowerCase())die('SHA256 mismatch '+asset.name);
+ console.log('SHA256 verified');
+}
+function extract(file,to){
+ fs.mkdirSync(to,{recursive:true});
+ if(process.platform==='win32'&&file.endsWith('.zip')){let q=s=>"'"+s.replace(/'/g,"''")+"'";return run('powershell.exe',['-NoProfile','-NonInteractive','-Command','Expand-Archive -LiteralPath '+q(file)+' -DestinationPath '+q(to)+' -Force']);}
+ let r=cp.spawnSync('tar',['-xf',file,'-C',to],{stdio:'inherit'});
+ if(!r.error&&r.status===0)return;
+ if(process.platform==='win32'&&file.endsWith('.7z')){let names=['7z.exe','7z','C:\\Program Files\\7-Zip\\7z.exe'];let bin=names.find(x=>fs.existsSync(x)||cp.spawnSync(x,['-h'],{stdio:'ignore'}).status===0);if(!bin)die('Install 7-Zip and retry');return run(bin,['x','-y','-o'+to,file]);}
+ die('Archive extract failed');
+}
+async function locate(dir,name,level=0){if(level>5)return null;for(let e of await fp.readdir(dir,{withFileTypes:true})){let file=path.join(dir,e.name);if(e.isFile()&&e.name.toLowerCase()===name.toLowerCase())return file;if(e.isDirectory()){let found=await locate(file,name,level+1);if(found)return found;}}return null;}
+async function installArchive(name,repo,mode,assetName,binary,beta){
+ let rel=await release(repo,beta);let results=rel.assets.filter(x=>x.name===assetName||assetName instanceof RegExp&&assetName.test(x.name));if(results.length!==1)die('Release asset not found or ambiguous');let asset=results[0];
+ let tmp=await fp.mkdtemp(path.join(os.tmpdir(),'pinokio-'));
+ try{let file=path.join(tmp,asset.name),dir=path.join(tmp,'stage');console.log('Downloading '+asset.browser_download_url);await download(asset.browser_download_url,file);await verify(rel,asset,file);extract(file,dir);
+ let exe=await locate(dir,binary);if(!exe)die('Missing '+binary+' in archive');
+ await fp.mkdir(app,{recursive:true});await fp.cp(path.dirname(exe),app,{recursive:true,force:true});if(process.platform!=='win32')await fp.chmod(path.join(app,binary),0o755);
+ if(name==='pymss')await fp.writeFile(path.join(app,'pymss-studio.portable'),'');
+ await fp.writeFile(path.join(app,'.pinokio-installed.json'),JSON.stringify({name,mode,version:rel.tag_name},null,2));console.log('Installed '+rel.tag_name);
+ }finally{await fp.rm(tmp,{recursive:true,force:true});}
+}
+async function linuxPymss(){
+ if(process.platform!=='linux')die('Linux only');let need=['git','pnpm','cargo','python3.12','pkg-config','ffmpeg'];let missing=need.filter(x=>{let r=cp.spawnSync(x,['--version'],{stdio:'ignore'});return r.error||r.status!==0;});if(missing.length)die('Missing prerequisites: '+missing.join(', '));
+ let src=path.join(app,'source');await fp.mkdir(app,{recursive:true});
+ if(!fs.existsSync(path.join(src,'.git')))run('git',['clone','--depth','1','https://github.com/pymss-project/pymss-studio.git',src]);else run('git',['-C',src,'pull','--ff-only']);
+ run('pnpm',['install','--frozen-lockfile'],{cwd:src});let py=path.join(src,'.venv','bin','python');if(!fs.existsSync(py))run('python3.12',['-m','venv',path.join(src,'.venv')],{cwd:src});run(py,['-m','pip','install','requests[socks]>=2.32,<3'],{cwd:src});
+ await fp.writeFile(path.join(app,'.pinokio-installed.json'),JSON.stringify({name:'pymss',mode:'source'}));console.log('Experimental Linux source prepared; compile via Start.');
+}
+async function install(name,mode){
+ if(!['win32','linux'].includes(process.platform)||process.arch!=='x64')die('Only x64 Windows/Linux supported');
+ if(name==='stemdeck'){let w=process.platform==='win32',file=w?'StemDeck-Windows-x64.NVIDIA.zip':'StemDeck-Linux-x64.NVIDIA.tar.gz';return installArchive(name,'stemdeckapp/stemdeck','nvidia',file,w?'StemDeck.exe':'StemDeck',false);}
+ if(name!=='pymss')die('Unknown app');if(process.platform==='linux')return linuxPymss();if(!['cuda','online'].includes(mode))die('Invalid Windows mode');
+ return installArchive(name,'pymss-project/pymss-studio',mode,new RegExp('^Pymss-Studio-[0-9.]+-windows-x64-'+mode+'\\.7z$'),'Pymss Studio.exe',true);
+}
+function start(name){
+ if(!fs.existsSync(path.join(app,'.pinokio-installed.json')))die('Not installed');
+ if(process.platform==='linux'&&!process.env.DISPLAY&&!process.env.WAYLAND_DISPLAY)die('Requires desktop session');
+ let cwd=app,bin,args=[],env={...process.env};
+ if(name==='pymss'&&process.platform==='linux'){cwd=path.join(app,'source');bin='pnpm';args=['tauri','dev'];env.PYMSS_STUDIO_PYTHON=path.join(cwd,'.venv','bin','python');}
+ else {bin=path.join(app,name==='stemdeck'?(process.platform==='win32'?'StemDeck.exe':'StemDeck'):'Pymss Studio.exe');if(!fs.existsSync(bin))die('Missing executable '+bin);}
+ let child=cp.spawn(bin,args,{cwd,env,stdio:'inherit'});for(let sig of ['SIGINT','SIGTERM'])process.on(sig,()=>child.kill(sig));child.on('error',err=>{console.error(err);process.exitCode=1;});child.on('exit',code=>{process.exitCode=code||0;});
+}
+(async()=>{let [cmd,name,mode]=process.argv.slice(2);if(cmd==='install')await install(name,mode);else if(cmd==='start')start(name);else die('Usage: node manager.js install|start app [mode]');})().catch(e=>{console.error(e.stack||e);process.exitCode=1;});

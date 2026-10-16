@@ -1,0 +1,10 @@
+{
+  "title": "StemDeck",
+  "description": "Unofficial Pinokio installer",
+  "links": [
+    {
+      "title": "Source",
+      "value": "https://github.com/ChrisTorng/stemdeck.pinokio"
+    }
+  ]
+}
