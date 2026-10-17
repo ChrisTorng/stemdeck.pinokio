@@ -24,12 +24,39 @@ function extract(file,to){
  die('Archive extract failed');
 }
 async function locate(dir,name,level=0){if(level>5)return null;for(let e of await fp.readdir(dir,{withFileTypes:true})){let file=path.join(dir,e.name);if(e.isFile()&&e.name.toLowerCase()===name.toLowerCase())return file;if(e.isDirectory()){let found=await locate(file,name,level+1);if(found)return found;}}return null;}
+async function copyPortable(from,to){
+ // Keep archive-relative links relative after the staging directory is removed.
+ await fp.cp(from,to,{recursive:true,force:true,verbatimSymlinks:true});
+}
+async function repairPortableLinks(dir){
+ let repaired=0;
+ async function visit(folder){
+  for(const entry of await fp.readdir(folder,{withFileTypes:true})){
+   const file=path.join(folder,entry.name);
+   if(entry.isDirectory())await visit(file);
+   else if(entry.isSymbolicLink()&&!fs.existsSync(file)){
+    const target=await fp.readlink(file);
+    // Earlier installers let fs.cp resolve links against its temporary stage.
+    const match=/[/\\]pinokio-[^/\\]+[/\\]stage[/\\][^/\\]+[/\\](.+)$/.exec(target);
+    if(!path.isAbsolute(target)||!match)continue;
+    const replacement=path.resolve(dir,match[1]);
+    if(!replacement.startsWith(path.resolve(dir)+path.sep)||!fs.existsSync(replacement))continue;
+    await fp.unlink(file);
+    await fp.symlink(path.relative(path.dirname(file),replacement),file);
+    repaired++;
+   }
+  }
+ }
+ await visit(dir);
+ if(repaired)console.log('Repaired '+repaired+' portable runtime links');
+ return repaired;
+}
 async function installArchive(name,repo,mode,assetName,binary,beta){
  let rel=await release(repo,beta);let results=rel.assets.filter(x=>x.name===assetName||assetName instanceof RegExp&&assetName.test(x.name));if(results.length!==1)die('Release asset not found or ambiguous');let asset=results[0];
  let tmp=await fp.mkdtemp(path.join(os.tmpdir(),'pinokio-'));
  try{let file=path.join(tmp,asset.name),dir=path.join(tmp,'stage');console.log('Downloading '+asset.browser_download_url);await download(asset.browser_download_url,file);await verify(rel,asset,file);extract(file,dir);
  let exe=await locate(dir,binary);if(!exe)die('Missing '+binary+' in archive');
- await fp.mkdir(app,{recursive:true});await fp.cp(path.dirname(exe),app,{recursive:true,force:true});if(process.platform!=='win32')await fp.chmod(path.join(app,binary),0o755);
+ await fp.mkdir(app,{recursive:true});await copyPortable(path.dirname(exe),app);if(process.platform!=='win32')await fp.chmod(path.join(app,binary),0o755);
  if(name==='pymss')await fp.writeFile(path.join(app,'pymss-studio.portable'),'');
  await fp.writeFile(path.join(app,'.pinokio-installed.json'),JSON.stringify({name,mode,version:rel.tag_name},null,2));console.log('Installed '+rel.tag_name);
  }finally{await fp.rm(tmp,{recursive:true,force:true});}
@@ -47,12 +74,19 @@ async function install(name,mode){
  if(name!=='pymss')die('Unknown app');if(process.platform==='linux')return linuxPymss();if(!['cuda','online'].includes(mode))die('Invalid Windows mode');
  return installArchive(name,'pymss-project/pymss-studio',mode,new RegExp('^Pymss-Studio-[0-9.]+-windows-x64-'+mode+'\\.7z$'),'Pymss Studio.exe',true);
 }
-function start(name){
+async function start(name){
  if(!fs.existsSync(path.join(app,'.pinokio-installed.json')))die('Not installed');
  if(process.platform==='linux'&&!process.env.DISPLAY&&!process.env.WAYLAND_DISPLAY)die('Requires desktop session');
+ if(process.platform==='linux'&&name==='stemdeck')await repairPortableLinks(app);
  let cwd=app,bin,args=[],env={...process.env};
+ // StemDeck manages its own portable Python, rather than a Pinokio venv.
+ if(name==='stemdeck')env.PIP_REQUIRE_VIRTUALENV='false';
+ // WebKit's accelerated compositor can stop repainting on remote Linux X11.
+ // This changes UI rendering only; CUDA audio processing stays enabled.
+ if(name==='stemdeck'&&process.platform==='linux')env.WEBKIT_DISABLE_COMPOSITING_MODE??='1';
  if(name==='pymss'&&process.platform==='linux'){cwd=path.join(app,'source');bin='pnpm';args=['tauri','dev'];env.PYMSS_STUDIO_PYTHON=path.join(cwd,'.venv','bin','python');}
  else {bin=path.join(app,name==='stemdeck'?(process.platform==='win32'?'StemDeck.exe':'StemDeck'):'Pymss Studio.exe');if(!fs.existsSync(bin))die('Missing executable '+bin);}
  let child=cp.spawn(bin,args,{cwd,env,stdio:'inherit'});for(let sig of ['SIGINT','SIGTERM'])process.on(sig,()=>child.kill(sig));child.on('error',err=>{console.error(err);process.exitCode=1;});child.on('exit',code=>{process.exitCode=code||0;});
 }
-(async()=>{let [cmd,name,mode]=process.argv.slice(2);if(cmd==='install')await install(name,mode);else if(cmd==='start')start(name);else die('Usage: node manager.js install|start app [mode]');})().catch(e=>{console.error(e.stack||e);process.exitCode=1;});
+module.exports={copyPortable,repairPortableLinks};
+if(require.main===module)(async()=>{let [cmd,name,mode]=process.argv.slice(2);if(cmd==='install')await install(name,mode);else if(cmd==='start')await start(name);else die('Usage: node manager.js install|start app [mode]');})().catch(e=>{console.error(e.stack||e);process.exitCode=1;});
