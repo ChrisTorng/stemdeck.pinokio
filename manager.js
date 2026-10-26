@@ -28,6 +28,22 @@ async function copyPortable(from,to){
  // Keep archive-relative links relative after the staging directory is removed.
  await fp.cp(from,to,{recursive:true,force:true,verbatimSymlinks:true});
 }
+async function readJson(file){try{return JSON.parse(await fp.readFile(file,'utf8'));}catch{return null;}}
+async function installedReleaseMatches(dir,name,mode,version,binary){
+ const installed=await readJson(path.join(dir,'.pinokio-installed.json'));
+ return installed?.name===name&&installed.mode===mode&&installed.version===version&&fs.existsSync(path.join(dir,binary))&&
+  (name!=='stemdeck'||fs.existsSync(path.join(dir,'python',process.platform==='win32'?'python.exe':'bin/python3')));
+}
+async function copyStemDeckUpdate(from,to){
+ // Upstream uses this dependency-set ID to decide whether python/ is reusable.
+ const old=await readJson(path.join(to,'python','runtime-version.json'));
+ const fresh=await readJson(path.join(from,'python','runtime-version.json'));
+ const python=path.join(to,'python',process.platform==='win32'?'python.exe':'bin/python3');
+ const keepPython=typeof old?.runtimeId==='string'&&old.runtimeId.length>0&&old.runtimeId===fresh?.runtimeId&&fs.existsSync(python);
+ if(!keepPython)return copyPortable(from,to);
+ console.log('Keeping installed Python/CUDA runtime (dependency set unchanged)');
+ await fp.cp(from,to,{recursive:true,force:true,verbatimSymlinks:true,filter:src=>src!==path.join(from,'python')});
+}
 async function repairPortableLinks(dir){
  let repaired=0;
  async function visit(folder){
@@ -53,10 +69,14 @@ async function repairPortableLinks(dir){
 }
 async function installArchive(name,repo,mode,assetName,binary,beta){
  let rel=await release(repo,beta);let results=rel.assets.filter(x=>x.name===assetName||assetName instanceof RegExp&&assetName.test(x.name));if(results.length!==1)die('Release asset not found or ambiguous');let asset=results[0];
+ if(await installedReleaseMatches(app,name,mode,rel.tag_name,binary)){
+  if(name==='stemdeck'&&process.platform==='linux')await repairPortableLinks(app);
+  console.log('Already installed '+rel.tag_name+'; keeping Python/CUDA runtime, no download needed');return;
+ }
  let tmp=await fp.mkdtemp(path.join(os.tmpdir(),'pinokio-'));
  try{let file=path.join(tmp,asset.name),dir=path.join(tmp,'stage');console.log('Downloading '+asset.browser_download_url);await download(asset.browser_download_url,file);await verify(rel,asset,file);extract(file,dir);
  let exe=await locate(dir,binary);if(!exe)die('Missing '+binary+' in archive');
- await fp.mkdir(app,{recursive:true});await copyPortable(path.dirname(exe),app);if(process.platform!=='win32')await fp.chmod(path.join(app,binary),0o755);
+ await fp.mkdir(app,{recursive:true});if(name==='stemdeck')await copyStemDeckUpdate(path.dirname(exe),app);else await copyPortable(path.dirname(exe),app);if(process.platform!=='win32')await fp.chmod(path.join(app,binary),0o755);
  if(name==='pymss')await fp.writeFile(path.join(app,'pymss-studio.portable'),'');
  await fp.writeFile(path.join(app,'.pinokio-installed.json'),JSON.stringify({name,mode,version:rel.tag_name},null,2));console.log('Installed '+rel.tag_name);
  }finally{await fp.rm(tmp,{recursive:true,force:true});}
@@ -74,7 +94,7 @@ async function install(name,mode){
  if(name!=='pymss')die('Unknown app');if(process.platform==='linux')return linuxPymss();if(!['cuda','online'].includes(mode))die('Invalid Windows mode');
  return installArchive(name,'pymss-project/pymss-studio',mode,new RegExp('^Pymss-Studio-[0-9.]+-windows-x64-'+mode+'\\.7z$'),'Pymss Studio.exe',true);
 }
-async function start(name){
+async function start(name,webPort){
  if(!fs.existsSync(path.join(app,'.pinokio-installed.json')))die('Not installed');
  if(process.platform==='linux'&&!process.env.DISPLAY&&!process.env.WAYLAND_DISPLAY)die('Requires desktop session');
  if(process.platform==='linux'&&name==='stemdeck')await repairPortableLinks(app);
@@ -87,6 +107,11 @@ async function start(name){
  if(name==='pymss'&&process.platform==='linux'){cwd=path.join(app,'source');bin='pnpm';args=['tauri','dev'];env.PYMSS_STUDIO_PYTHON=path.join(cwd,'.venv','bin','python');}
  else {bin=path.join(app,name==='stemdeck'?(process.platform==='win32'?'StemDeck.exe':'StemDeck'):'Pymss Studio.exe');if(!fs.existsSync(bin))die('Missing executable '+bin);}
  let child=cp.spawn(bin,args,{cwd,env,stdio:'inherit'});for(let sig of ['SIGINT','SIGTERM'])process.on(sig,()=>child.kill(sig));child.on('error',err=>{console.error(err);process.exitCode=1;});child.on('exit',code=>{process.exitCode=code||0;});
+ if(name==='stemdeck'&&webPort!==undefined){
+  const port=Number(webPort);if(!Number.isInteger(port)||port<1||port>65535){child.kill();die('Invalid web port');}
+  const data=env.STEMDECK_DATA_DIR||(process.platform==='win32'?(fs.existsSync(path.join(app,'portable.txt'))?path.join(app,'data'):path.join(env.LOCALAPPDATA||path.join(os.homedir(),'AppData','Local'),'StemDeck')):path.join(env.XDG_DATA_HOME||path.join(os.homedir(),'.local','share'),'stemdeck'));
+  void require('./web-ui.js').exposeWebUI(child,port,path.join(data,'logs','backend.log'));
+ }
 }
-module.exports={copyPortable,repairPortableLinks};
-if(require.main===module)(async()=>{let [cmd,name,mode]=process.argv.slice(2);if(cmd==='install')await install(name,mode);else if(cmd==='start')await start(name);else die('Usage: node manager.js install|start app [mode]');})().catch(e=>{console.error(e.stack||e);process.exitCode=1;});
+module.exports={copyPortable,repairPortableLinks,installedReleaseMatches,copyStemDeckUpdate};
+if(require.main===module)(async()=>{let [cmd,name,mode]=process.argv.slice(2);if(cmd==='install')await install(name,mode);else if(cmd==='start')await start(name,mode);else die('Usage: node manager.js install|start app [mode or web port]');})().catch(e=>{console.error(e.stack||e);process.exitCode=1;});
