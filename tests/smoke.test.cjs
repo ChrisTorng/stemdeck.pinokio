@@ -1,5 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
-for(const x of ['manager.js','web-ui.js','pinokio.js','install.js','update.js','reset.js','start.js']){
+for(const x of ['manager.js','media-tools.js','web-ui.js','pinokio.js','install.js','update.js','reset.js','start.js']){
  test(x+' parses',()=>{new vm.Script(fs.readFileSync(path.join(__dirname,'..',x),'utf8'));});
 }
 test('menu has install action',async()=>{let items=await require('../pinokio.js').menu({platform:'win32'},{running:()=>false,exists:()=>false});assert.ok(items.some(x=>x.href==='install.js'));});
@@ -100,15 +100,18 @@ test('portable child supports Pinokio pip and remote Linux rendering',{skip:proc
  t.after(()=>fp.rm(temp,{recursive:true,force:true}));
  await fp.mkdir(path.join(temp,'app'));
  await fp.copyFile(path.join(__dirname,'..','manager.js'),path.join(temp,'manager.js'));
+ await fp.copyFile(path.join(__dirname,'..','media-tools.js'),path.join(temp,'media-tools.js'));
  await fp.writeFile(path.join(temp,'app','.pinokio-installed.json'),'{}');
- await fp.writeFile(path.join(temp,'app','StemDeck'),'#!/bin/sh\nprintf "%s,%s" "$PIP_REQUIRE_VIRTUALENV" "$WEBKIT_DISABLE_COMPOSITING_MODE"\n',{mode:0o755});
+ await fp.writeFile(path.join(temp,'app','StemDeck'),'#!/bin/sh\nprintf "media=%s|%s|%s\\n%s,%s" "$STEMDECK_FFMPEG" "$STEMDECK_FFPROBE" "${PATH%%:*}" "$PIP_REQUIRE_VIRTUALENV" "$WEBKIT_DISABLE_COMPOSITING_MODE"\n',{mode:0o755});
  const execFile=require('node:util').promisify(require('node:child_process').execFile);
  const env={...process.env,DISPLAY:':test',PIP_REQUIRE_VIRTUALENV:'true'};
  delete env.WEBKIT_DISABLE_COMPOSITING_MODE;
  const result=await execFile(process.execPath,[path.join(temp,'manager.js'),'start','stemdeck'],{env});
- assert.equal(result.stdout,'false,1');
+ const media=require('../media-tools').findMediaTools(temp,env);
+ assert.ok(result.stdout.includes('media='+media.ffmpeg+'|'+media.ffprobe+'|'+path.dirname(media.ffmpeg)));
+ assert.ok(result.stdout.endsWith('false,1'));
  const override=await execFile(process.execPath,[path.join(temp,'manager.js'),'start','stemdeck'],{env:{...env,WEBKIT_DISABLE_COMPOSITING_MODE:'0'}});
- assert.equal(override.stdout,'false,0');
+ assert.ok(override.stdout.endsWith('false,0'));
 });
 test('portable Python survives staging cleanup and a repeated install',{skip:process.platform==='win32'},async t=>{
  const temp=await fp.mkdtemp(path.join(os.tmpdir(),'stemdeck-test-'));

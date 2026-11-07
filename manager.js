@@ -1,6 +1,7 @@
 'use strict';
 const fs=require('node:fs'),fp=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),crypto=require('node:crypto'),cp=require('node:child_process');
 const {Readable}=require('node:stream'),{pipeline}=require('node:stream/promises');
+const {findMediaTools,ensureMediaTools}=require('./media-tools');
 const root=__dirname,app=path.join(root,'app'),headers={'User-Agent':'pinokio-launcher','Accept':'application/vnd.github+json'};
 function die(s){throw Error(s)}
 function run(cmd,args,opts={}){let p=cp.spawnSync(cmd,args,{stdio:'inherit',...opts});if(p.error)throw p.error;if(p.status!==0)die(cmd+' failed: '+p.status);}
@@ -90,7 +91,7 @@ async function linuxPymss(){
 }
 async function install(name,mode){
  if(!['win32','linux'].includes(process.platform)||process.arch!=='x64')die('Only x64 Windows/Linux supported');
- if(name==='stemdeck'){let w=process.platform==='win32',file=w?'StemDeck-Windows-x64.NVIDIA.zip':'StemDeck-Linux-x64.NVIDIA.tar.gz';return installArchive(name,'stemdeckapp/stemdeck','nvidia',file,w?'StemDeck.exe':'StemDeck',false);}
+ if(name==='stemdeck'){await ensureMediaTools(root);let w=process.platform==='win32',file=w?'StemDeck-Windows-x64.NVIDIA.zip':'StemDeck-Linux-x64.NVIDIA.tar.gz';return installArchive(name,'stemdeckapp/stemdeck','nvidia',file,w?'StemDeck.exe':'StemDeck',false);}
  if(name!=='pymss')die('Unknown app');if(process.platform==='linux')return linuxPymss();if(!['cuda','online'].includes(mode))die('Invalid Windows mode');
  return installArchive(name,'pymss-project/pymss-studio',mode,new RegExp('^Pymss-Studio-[0-9.]+-windows-x64-'+mode+'\\.7z$'),'Pymss Studio.exe',true);
 }
@@ -99,6 +100,16 @@ async function start(name,webPort){
  if(process.platform==='linux'&&!process.env.DISPLAY&&!process.env.WAYLAND_DISPLAY)die('Requires desktop session');
  if(process.platform==='linux'&&name==='stemdeck')await repairPortableLinks(app);
  let cwd=app,bin,args=[],env={...process.env};
+ if(name==='stemdeck'){
+  const media=findMediaTools(root,env);
+  if(!media)die('FFmpeg with rubberband is required. Run Install/Update to repair media tools; user libraries and models are preserved.');
+  env.STEMDECK_FFMPEG=media.ffmpeg;env.STEMDECK_FFPROBE=media.ffprobe;
+  // The desktop first-run setup resolves PATH and can replace these overrides.
+  // Give that setup the same verified pair as the backend export API.
+  env.PATH=path.dirname(media.ffmpeg)+path.delimiter+(env.PATH||env.Path||'');
+  if(process.platform==='win32')delete env.Path;
+  console.log('StemDeck native transpose FFmpeg: '+media.ffmpeg);
+ }
  // StemDeck manages its own portable Python, rather than a Pinokio venv.
  if(name==='stemdeck')env.PIP_REQUIRE_VIRTUALENV='false';
  // WebKit's accelerated compositor can stop repainting on remote Linux X11.

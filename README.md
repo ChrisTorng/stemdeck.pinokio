@@ -1,5 +1,17 @@
 # StemDeck — Pinokio launcher (unofficial)
 
+Native transpose exports require an FFmpeg build with the `rubberband` filter.
+Install/Update now checks FFmpeg and ffprobe together, skipping incompatible
+copies earlier on PATH (including a Pinokio FFmpeg without rubberband). If no
+capable pair is available, it installs a GPL FFmpeg build from conda-forge in
+the launcher's `cache/ffmpeg-runtime` prefix. Start passes the verified pair to
+StemDeck using its supported environment settings. Explicit user overrides
+are checked and reported if incompatible.
+
+Re-running Install repairs media prerequisites even when the application
+release is already installed. It preserves the existing Python/CUDA runtime,
+downloaded models, song library and produced audio; Reset is not needed.
+
 Unofficial Pinokio installer for [StemDeck](https://github.com/stemdeckapp/stemdeck), supporting **Windows x64 / NVIDIA** and **Linux x64 / NVIDIA** (including Ubuntu).
 
 ## Install
